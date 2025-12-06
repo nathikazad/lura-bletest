@@ -10,13 +10,24 @@ import {
   Alert,
 } from 'react-native';
 import { BleManager, Device, Characteristic } from 'react-native-ble-plx';
+import { Buffer } from 'buffer';
 import { createBleManager } from './src/services/BleService';
+
+// Arduino device constants
+const ARDUINO_SERVICE_UUID = '19B10000-E8F2-537E-4F6C-D104768A1214';
+const ARDUINO_CHARACTERISTIC_UUID = '19B10001-E8F2-537E-4F6C-D104768A1214';
+const ARDUINO_DEVICE_NAME = 'RandomNumber';
+
+interface RandomNumberData {
+  timestamp: string;
+  value: number;
+}
 
 const App = () => {
   const [isScanning, setIsScanning] = useState(false);
   const [devices, setDevices] = useState<Device[]>([]);
   const [connectedDevice, setConnectedDevice] = useState<Device | null>(null);
-  const [receivedData, setReceivedData] = useState<string[]>([]);
+  const [randomNumbers, setRandomNumbers] = useState<RandomNumberData[]>([]);
   const [bleManager] = useState(() => createBleManager());
 
   useEffect(() => {
@@ -49,11 +60,9 @@ const App = () => {
     setIsScanning(true);
     setDevices([]);
 
-    // Start scanning - specify service UUID for background mode
-    // Replace with your actual service UUID or null to scan for all devices
+    // Start scanning for the Arduino device by service UUID
     bleManager.startDeviceScan(
-      null, // null = scan for all devices (foreground only)
-      // 'YOUR_SERVICE_UUID', // Specify service UUID for background scanning
+      [ARDUINO_SERVICE_UUID], // Scan specifically for the Arduino service
       { allowDuplicates: false },
       (error, device) => {
         if (error) {
@@ -63,23 +72,34 @@ const App = () => {
         }
 
         if (device) {
-          setDevices((prevDevices) => {
-            // Avoid duplicates
-            const exists = prevDevices.find((d) => d.id === device.id);
-            if (!exists) {
-              return [...prevDevices, device];
-            }
-            return prevDevices;
-          });
+          // Check if it's the Arduino device by name or service UUID
+          const isArduinoDevice = 
+            device.name === ARDUINO_DEVICE_NAME || 
+            device.serviceUUIDs?.includes(ARDUINO_SERVICE_UUID);
+
+          if (isArduinoDevice) {
+            setDevices((prevDevices) => {
+              // Avoid duplicates
+              const exists = prevDevices.find((d) => d.id === device.id);
+              if (!exists) {
+                // Auto-connect to the Arduino device
+                connectToDevice(device);
+                return [...prevDevices, device];
+              }
+              return prevDevices;
+            });
+          }
         }
       }
     );
 
-    // Stop scanning after 10 seconds
+    // Stop scanning after 30 seconds if not connected
     setTimeout(() => {
-      bleManager.stopDeviceScan();
-      setIsScanning(false);
-    }, 10000);
+      if (!connectedDevice) {
+        bleManager.stopDeviceScan();
+        setIsScanning(false);
+      }
+    }, 30000);
   };
 
   const stopScan = () => {
@@ -101,41 +121,58 @@ const App = () => {
       deviceConnection.onDisconnected((error, device) => {
         console.log('Device disconnected:', device?.id);
         setConnectedDevice(null);
+        setRandomNumbers([]);
         if (error) {
           Alert.alert('Disconnection', `Device disconnected: ${error.message}`);
         }
       });
 
-      // Subscribe to all characteristics that support notifications
+      // Find and subscribe to the Arduino random number characteristic
       const services = await deviceConnection.services();
       
       for (const service of services) {
-        const characteristics = await service.characteristics();
-        
-        for (const characteristic of characteristics) {
-          if (characteristic.isNotifiable || characteristic.isIndicatable) {
-            try {
-              await characteristic.monitor((error, char) => {
-                if (error) {
-                  console.error('Characteristic monitor error:', error);
-                  return;
-                }
+        if (service.uuid.toLowerCase() === ARDUINO_SERVICE_UUID.toLowerCase()) {
+          const characteristics = await service.characteristics();
+          
+          for (const characteristic of characteristics) {
+            if (characteristic.uuid.toLowerCase() === ARDUINO_CHARACTERISTIC_UUID.toLowerCase()) {
+              if (characteristic.isNotifiable || characteristic.isIndicatable) {
+                try {
+                  await characteristic.monitor((error, char) => {
+                    if (error) {
+                      console.error('Characteristic monitor error:', error);
+                      return;
+                    }
 
-                if (char?.value) {
-                  const data = char.value;
-                  const timestamp = new Date().toLocaleTimeString();
-                  setReceivedData((prev) => [
-                    ...prev,
-                    `${timestamp}: ${data}`,
-                  ]);
-                  console.log('Received data:', data);
+                    if (char?.value) {
+                      // Parse the base64 encoded byte value
+                      try {
+                        // The value is base64 encoded, decode it to get the byte
+                        const base64Value = char.value;
+                        // react-native-ble-plx returns base64 encoded data
+                        const buffer = Buffer.from(base64Value, 'base64');
+                        // Get the first byte (0-255)
+                        const randomValue = buffer.readUInt8(0);
+                        
+                        const timestamp = new Date().toISOString();
+                        const data: RandomNumberData = {
+                          timestamp,
+                          value: randomValue,
+                        };
+                        
+                        setRandomNumbers((prev) => [data, ...prev]);
+                        console.log('Received random number:', randomValue);
+                      } catch (parseError) {
+                        console.error('Error parsing random number:', parseError);
+                      }
+                    }
+                  });
+                  console.log('Subscribed to random number characteristic');
+                } catch (err) {
+                  console.error('Could not monitor characteristic:', err);
+                  Alert.alert('Error', 'Could not subscribe to random number characteristic');
                 }
-              });
-            } catch (err) {
-              console.log(
-                `Could not monitor characteristic ${characteristic.uuid}:`,
-                err
-              );
+              }
             }
           }
         }
@@ -153,7 +190,7 @@ const App = () => {
       try {
         await connectedDevice.cancelConnection();
         setConnectedDevice(null);
-        setReceivedData([]);
+        setRandomNumbers([]);
       } catch (error: any) {
         Alert.alert('Disconnect Error', error.message);
       }
@@ -195,34 +232,59 @@ const App = () => {
           )}
         </View>
 
-        <View style={styles.section}>
-          <Text style={styles.sectionTitle}>
-            Found Devices ({devices.length})
-          </Text>
-          {devices.map((device) => (
-            <TouchableOpacity
-              key={device.id}
-              style={styles.deviceItem}
-              onPress={() => connectToDevice(device)}>
-              <Text style={styles.deviceName}>
-                {device.name || 'Unknown Device'}
-              </Text>
-              <Text style={styles.deviceId}>{device.id}</Text>
-              <Text style={styles.deviceRssi}>RSSI: {device.rssi}</Text>
-            </TouchableOpacity>
-          ))}
-        </View>
-
-        {receivedData.length > 0 && (
+        {!connectedDevice && (
           <View style={styles.section}>
             <Text style={styles.sectionTitle}>
-              Received Data ({receivedData.length})
+              Scanning for Arduino Device...
             </Text>
-            {receivedData.slice(-10).map((data, index) => (
-              <View key={index} style={styles.dataItem}>
-                <Text style={styles.dataText}>{data}</Text>
+            {devices.length > 0 && (
+              <View style={styles.deviceItem}>
+                <Text style={styles.deviceName}>
+                  {devices[0].name || 'Arduino Device'}
+                </Text>
+                <Text style={styles.deviceId}>{devices[0].id}</Text>
+                <Text style={styles.deviceRssi}>RSSI: {devices[0].rssi}</Text>
               </View>
-            ))}
+            )}
+          </View>
+        )}
+
+        {connectedDevice && (
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>
+              Random Number Stream ({randomNumbers.length})
+            </Text>
+            {randomNumbers.length === 0 ? (
+              <View style={styles.dataItem}>
+                <Text style={styles.dataText}>Waiting for data...</Text>
+              </View>
+            ) : (
+              <ScrollView 
+                style={styles.streamContainer}
+                nestedScrollEnabled={true}
+                showsVerticalScrollIndicator={true}>
+                {randomNumbers.map((data, index) => {
+                  const date = new Date(data.timestamp);
+                  const timeString = date.toLocaleTimeString('en-US', {
+                    hour12: false,
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    second: '2-digit',
+                    fractionalSecondDigits: 3,
+                  });
+                  
+                  return (
+                    <View key={index} style={styles.dataItem}>
+                      <Text style={styles.dataText}>
+                        <Text style={styles.timestampText}>{timeString}</Text>
+                        {' → '}
+                        <Text style={styles.valueText}>{data.value}</Text>
+                      </Text>
+                    </View>
+                  );
+                })}
+              </ScrollView>
+            )}
           </View>
         )}
       </ScrollView>
@@ -323,6 +385,21 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#333',
     fontFamily: 'monospace',
+  },
+  streamContainer: {
+    maxHeight: 400,
+    backgroundColor: '#f9f9f9',
+    borderRadius: 8,
+    padding: 8,
+  },
+  timestampText: {
+    color: '#666',
+    fontSize: 12,
+  },
+  valueText: {
+    color: '#007AFF',
+    fontSize: 16,
+    fontWeight: '600',
   },
 });
 
