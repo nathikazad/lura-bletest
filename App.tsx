@@ -1,26 +1,26 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import {
   SafeAreaView,
   ScrollView,
   StatusBar,
   StyleSheet,
   Text,
+  TextInput,
   TouchableOpacity,
   View,
   Alert,
 } from 'react-native';
-import { BleManager, Device, Characteristic } from 'react-native-ble-plx';
+import { BleManager, Device } from 'react-native-ble-plx';
 import { Buffer } from 'buffer';
 import { createBleManager } from './src/services/BleService';
 
-// Arduino device constants
-const ARDUINO_SERVICE_UUID = '19B10000-E8F2-537E-4F6C-D104768A1214';
-const ARDUINO_CHARACTERISTIC_UUID = '19B10001-E8F2-537E-4F6C-D104768A1214';
-const ARDUINO_DEVICE_NAME = 'RandomNumber';
-const ARDUINO_DEVICE_NAME_ALT = 'Arduino'; // Alternative name that might appear
+// ESP32 device constants
+const ESP32_SERVICE_UUID = '19B10000-E8F2-537E-4F6C-D104768A1214';
+const ESP32_CHARACTERISTIC_UUID = '19B10001-E8F2-537E-4F6C-D104768A1214';
+const ESP32_DEVICE_NAME = 'RandomNumber';
 
-// Ngrok server URL
-const NGROK_SERVER_URL = 'https://1ccc2d4af2ca.ngrok-free.app/number';
+// Default Ngrok server URL
+const DEFAULT_NGROK_SERVER_URL = 'https://885bd333b988.ngrok-free.app/number';
 
 interface RandomNumberData {
   timestamp: string;
@@ -28,13 +28,19 @@ interface RandomNumberData {
 }
 
 const App = () => {
+  const [isConnected, setIsConnected] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
-  const [devices, setDevices] = useState<Device[]>([]);
-  const [connectedDevice, setConnectedDevice] = useState<Device | null>(null);
   const [randomNumbers, setRandomNumbers] = useState<RandomNumberData[]>([]);
-  const [bleManager] = useState(() => createBleManager());
   const [lastForwardedValue, setLastForwardedValue] = useState<number | null>(null);
   const [forwardError, setForwardError] = useState<string | null>(null);
+  const [connectionStatus, setConnectionStatus] = useState<string>('Not connected');
+  const [deviceId, setDeviceId] = useState<string | null>(null);
+  const [serverUrl, setServerUrl] = useState<string>(DEFAULT_NGROK_SERVER_URL);
+  const [showUrlEditor, setShowUrlEditor] = useState(false);
+  
+  const bleManager = useRef<BleManager>(createBleManager()).current;
+  const connectedDeviceRef = useRef<Device | null>(null);
+  const isConnectingRef = useRef(false);
 
   useEffect(() => {
     // Check if Bluetooth is enabled
@@ -48,91 +54,215 @@ const App = () => {
     const subscription = bleManager.onStateChange((state) => {
       if (state === 'PoweredOn') {
         console.log('Bluetooth is powered on');
-      } else {
-        Alert.alert('Bluetooth', 'Bluetooth is not available');
+        // Auto-start scanning when Bluetooth is enabled
+        if (!isConnected && !isScanning) {
+          startReconnectionScan();
+        }
       }
     });
 
+    // Auto-start scanning on mount
+    startReconnectionScan();
+
     return () => {
       subscription.remove();
+      bleManager.stopDeviceScan();
     };
-  }, [bleManager]);
+  }, []);
 
-  const startScan = () => {
-    if (isScanning) {
+  const startReconnectionScan = () => {
+    if (isScanning || isConnectingRef.current) {
       return;
     }
 
+    console.log('Starting reconnection scan for ESP32 device...');
     setIsScanning(true);
-    setDevices([]);
+    setConnectionStatus('Scanning for ESP32...');
 
-    // Start scanning for all devices (service UUID filtering may be too restrictive)
     bleManager.startDeviceScan(
-      null, // Scan all devices, then filter by service UUID or name
-      { allowDuplicates: false },
+      [ESP32_SERVICE_UUID], // Service UUID filter for background scanning
+      { allowDuplicates: true }, // Allow duplicates to catch every advertising window
       (error, device) => {
         if (error) {
           console.error('Scan error:', error);
-          setIsScanning(false);
           return;
         }
 
-        if (device) {
-          // Check if it's the Arduino device by name or service UUID
-          const deviceName = device.name || '';
-          const serviceUUIDs = device.serviceUUIDs || [];
-          
-          // Normalize UUIDs for comparison (case-insensitive)
-          const normalizedServiceUUID = ARDUINO_SERVICE_UUID.toLowerCase();
-          const hasMatchingService = serviceUUIDs.some(
-            uuid => uuid.toLowerCase() === normalizedServiceUUID
-          );
-          
-          const isArduinoDevice = 
-            deviceName === ARDUINO_DEVICE_NAME ||
-            deviceName === ARDUINO_DEVICE_NAME_ALT ||
-            deviceName.toLowerCase().includes('arduino') ||
-            hasMatchingService;
-
-          if (isArduinoDevice) {
-            console.log('Found Arduino device:', {
+        if (device && !isConnected && !isConnectingRef.current) {
+          console.log('ESP32 device detected:', {
               name: device.name,
               id: device.id,
-              serviceUUIDs: device.serviceUUIDs,
-            });
-            
-            setDevices((prevDevices) => {
-              // Avoid duplicates
-              const exists = prevDevices.find((d) => d.id === device.id);
-              if (!exists) {
-                // Auto-connect to the Arduino device
-                connectToDevice(device);
-                return [...prevDevices, device];
-              }
-              return prevDevices;
-            });
-          }
+          });
+          connectToDevice(device);
         }
       }
     );
-
-    // Stop scanning after 30 seconds if not connected
-    setTimeout(() => {
-      if (!connectedDevice) {
-        bleManager.stopDeviceScan();
-        setIsScanning(false);
-      }
-    }, 30000);
   };
 
-  const stopScan = () => {
-    bleManager.stopDeviceScan();
+  const handleCharacteristicValue = (value: string | null) => {
+    if (!value) return;
+    
+    try {
+      const base64Value = value;
+      const buffer = Buffer.from(base64Value, 'base64');
+      const randomValue = buffer.readUInt8(0);
+      
+      const timestamp = new Date().toISOString();
+      const data: RandomNumberData = {
+        timestamp,
+        value: randomValue,
+      };
+      
+      setRandomNumbers((prev) => [data, ...prev]);
+      console.log('Received random number:', randomValue);
+      
+      // Forward to server
+      forwardToServer(randomValue);
+    } catch (parseError) {
+      console.error('Error parsing random number:', parseError);
+    }
+  };
+
+  const connectToDevice = async (device: Device) => {
+    if (isConnectingRef.current) {
+      return;
+    }
+
+    isConnectingRef.current = true;
     setIsScanning(false);
+    setConnectionStatus('Connecting...');
+    bleManager.stopDeviceScan();
+
+    let deviceConnection: Device | null = null;
+
+    try {
+      deviceConnection = await device.connect();
+      connectedDeviceRef.current = deviceConnection;
+      setIsConnected(true);
+      setDeviceId(device.id);
+      setConnectionStatus(`Connected: ${device.name || device.id}`);
+
+      // Monitor device disconnection FIRST (before any async operations)
+      deviceConnection.onDisconnected((error, device) => {
+        console.log('Device disconnected (expected - ESP32 sleeping):', device?.id, error?.message);
+        connectedDeviceRef.current = null;
+        setIsConnected(false);
+        setConnectionStatus('Disconnected - Waiting for ESP32 to wake up...');
+        isConnectingRef.current = false;
+        
+        // Start scanning again to catch when device wakes up
+        setTimeout(() => {
+          startReconnectionScan();
+        }, 500);
+      });
+
+      // Discover services and characteristics
+      await deviceConnection.discoverAllServicesAndCharacteristics();
+
+      // Find and subscribe to the random number characteristic
+      const services = await deviceConnection.services();
+      
+      for (const service of services) {
+        if (service.uuid.toLowerCase() === ESP32_SERVICE_UUID.toLowerCase()) {
+          const characteristics = await service.characteristics();
+          
+          for (const characteristic of characteristics) {
+            if (characteristic.uuid.toLowerCase() === ESP32_CHARACTERISTIC_UUID.toLowerCase()) {
+              // Read initial value first (ESP32 sends immediately on connection)
+              try {
+                const initialValue = await characteristic.read();
+                if (initialValue?.value) {
+                  console.log('Read initial characteristic value');
+                  handleCharacteristicValue(initialValue.value);
+                }
+              } catch (readError) {
+                console.log('Could not read initial value (may not be available):', readError);
+              }
+
+              // Then set up monitoring for notifications
+              if (characteristic.isNotifiable || characteristic.isIndicatable) {
+                try {
+                  await characteristic.monitor((error, char) => {
+                    if (error) {
+                      // Don't log disconnection errors as errors - they're expected
+                      if (error.message?.includes('disconnected')) {
+                        console.log('Monitor stopped due to disconnection (expected)');
+                        return;
+                      }
+                      console.error('Characteristic monitor error:', error);
+                      return;
+                    }
+
+                    if (char?.value) {
+                      handleCharacteristicValue(char.value);
+                    }
+                  });
+                  console.log('Subscribed to random number characteristic notifications');
+                } catch (err: any) {
+                  console.error('Could not monitor characteristic:', err);
+                  // Don't show alert for expected disconnections
+                  if (!err?.message?.includes('disconnected')) {
+                    Alert.alert('Error', 'Could not subscribe to random number characteristic');
+                  }
+                }
+              } else {
+                // If not notifiable, try reading periodically
+                console.log('Characteristic is not notifiable, will read periodically');
+                const readInterval = setInterval(async () => {
+                  if (!connectedDeviceRef.current || !isConnected) {
+                    clearInterval(readInterval);
+                    return;
+                  }
+                  try {
+                    const value = await characteristic.read();
+                    if (value?.value) {
+                      handleCharacteristicValue(value.value);
+                    }
+                  } catch (err) {
+                    clearInterval(readInterval);
+                  }
+                }, 1000);
+              }
+            }
+          }
+        }
+      }
+
+      isConnectingRef.current = false;
+    } catch (error: any) {
+      // Check if error is due to disconnection (expected behavior)
+      const errorMessage = error?.message || '';
+      const isDisconnectionError = 
+        errorMessage.includes('disconnected') || 
+        errorMessage.includes('Device was disconnected');
+      
+      if (isDisconnectionError) {
+        console.log('Connection interrupted by disconnection (expected - ESP32 sleeping)');
+        setConnectionStatus('Disconnected - Waiting for ESP32 to wake up...');
+      } else {
+        console.error('Connection error:', error);
+        setConnectionStatus('Connection failed - Retrying...');
+      }
+      
+      setIsConnected(false);
+      connectedDeviceRef.current = null;
+      isConnectingRef.current = false;
+      
+      // Retry connection after a short delay
+      setTimeout(() => {
+        startReconnectionScan();
+      }, 2000);
+    }
   };
 
   const forwardToServer = async (number: number) => {
+    if (!serverUrl || serverUrl.trim() === '') {
+      console.log('Server URL not set, skipping forward');
+      return;
+    }
+
     try {
-      const response = await fetch(NGROK_SERVER_URL, {
+      const response = await fetch(serverUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -155,177 +285,165 @@ const App = () => {
     }
   };
 
-  const connectToDevice = async (device: Device) => {
-    try {
-      stopScan();
-
-      const deviceConnection = await device.connect();
-      setConnectedDevice(deviceConnection);
-
-      // Discover services and characteristics
-      await deviceConnection.discoverAllServicesAndCharacteristics();
-
-      // Monitor device disconnection
-      deviceConnection.onDisconnected((error, device) => {
-        console.log('Device disconnected:', device?.id);
-        setConnectedDevice(null);
-        setRandomNumbers([]);
-        setLastForwardedValue(null);
-        setForwardError(null);
-        if (error) {
-          Alert.alert('Disconnection', `Device disconnected: ${error.message}`);
-        }
-      });
-
-      // Find and subscribe to the Arduino random number characteristic
-      const services = await deviceConnection.services();
-      
-      for (const service of services) {
-        if (service.uuid.toLowerCase() === ARDUINO_SERVICE_UUID.toLowerCase()) {
-          const characteristics = await service.characteristics();
-          
-          for (const characteristic of characteristics) {
-            if (characteristic.uuid.toLowerCase() === ARDUINO_CHARACTERISTIC_UUID.toLowerCase()) {
-              if (characteristic.isNotifiable || characteristic.isIndicatable) {
-                try {
-                  await characteristic.monitor((error, char) => {
-                    if (error) {
-                      console.error('Characteristic monitor error:', error);
-                      return;
-                    }
-
-                    if (char?.value) {
-                      // Parse the base64 encoded byte value
-                      try {
-                        // The value is base64 encoded, decode it to get the byte
-                        const base64Value = char.value;
-                        // react-native-ble-plx returns base64 encoded data
-                        const buffer = Buffer.from(base64Value, 'base64');
-                        // Get the first byte (0-255)
-                        const randomValue = buffer.readUInt8(0);
-                        
-                        const timestamp = new Date().toISOString();
-                        const data: RandomNumberData = {
-                          timestamp,
-                          value: randomValue,
-                        };
-                        
-                        setRandomNumbers((prev) => [data, ...prev]);
-                        console.log('Received random number:', randomValue);
-                        
-                        // Forward to ngrok server
-                        forwardToServer(randomValue);
-                      } catch (parseError) {
-                        console.error('Error parsing random number:', parseError);
-                      }
-                    }
-                  });
-                  console.log('Subscribed to random number characteristic');
-                } catch (err) {
-                  console.error('Could not monitor characteristic:', err);
-                  Alert.alert('Error', 'Could not subscribe to random number characteristic');
-                }
-              }
-            }
-          }
-        }
+  const handleManualDisconnect = async () => {
+    if (connectedDeviceRef.current) {
+      try {
+        await connectedDeviceRef.current.cancelConnection();
+        connectedDeviceRef.current = null;
+        setIsConnected(false);
+        setConnectionStatus('Manually disconnected');
+        isConnectingRef.current = false;
+        // Don't auto-reconnect after manual disconnect
+        bleManager.stopDeviceScan();
+        setIsScanning(false);
+      } catch (error: any) {
+        console.error('Disconnect error:', error);
       }
-
-      Alert.alert('Success', `Connected to ${device.name || device.id}`);
-    } catch (error: any) {
-      Alert.alert('Connection Error', error.message);
-      console.error('Connection error:', error);
     }
   };
 
-  const disconnectDevice = async () => {
-    if (connectedDevice) {
-      try {
-        await connectedDevice.cancelConnection();
-        setConnectedDevice(null);
-        setRandomNumbers([]);
-        setLastForwardedValue(null);
-        setForwardError(null);
-      } catch (error: any) {
-        Alert.alert('Disconnect Error', error.message);
-      }
+  const handleStartScan = () => {
+    if (!isScanning && !isConnected) {
+      startReconnectionScan();
     }
+  };
+
+  const handleStopScan = () => {
+    bleManager.stopDeviceScan();
+    setIsScanning(false);
+    setConnectionStatus('Scanning stopped');
   };
 
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="dark-content" />
+      
+      {/* Header */}
       <View style={styles.header}>
-        <Text style={styles.title}>BLE Scanner</Text>
-        <Text style={styles.subtitle}>
-          {connectedDevice
-            ? `Connected: ${connectedDevice.name || connectedDevice.id}`
-            : 'Not connected'}
-        </Text>
+        <Text style={styles.title}>ESP32 Random Number Monitor</Text>
+        <View style={styles.statusContainer}>
+          <View style={[
+            styles.statusIndicator,
+            { backgroundColor: isConnected ? '#4CAF50' : isScanning ? '#FF9800' : '#9E9E9E' }
+          ]} />
+          <Text style={styles.statusText}>{connectionStatus}</Text>
+        </View>
+        {deviceId && (
+          <Text style={styles.deviceId}>Device ID: {deviceId}</Text>
+        )}
       </View>
 
-      <ScrollView style={styles.content}>
-        <View style={styles.buttonContainer}>
+      {/* Controls */}
+      <View style={styles.controls}>
+        {!isConnected && (
+          <>
           {!isScanning ? (
-            <TouchableOpacity style={styles.button} onPress={startScan}>
+              <TouchableOpacity style={styles.button} onPress={handleStartScan}>
               <Text style={styles.buttonText}>Start Scan</Text>
             </TouchableOpacity>
           ) : (
-            <TouchableOpacity
-              style={[styles.button, styles.buttonStop]}
-              onPress={stopScan}>
+              <TouchableOpacity style={[styles.button, styles.buttonStop]} onPress={handleStopScan}>
               <Text style={styles.buttonText}>Stop Scan</Text>
             </TouchableOpacity>
           )}
-
-          {connectedDevice && (
-            <TouchableOpacity
-              style={[styles.button, styles.buttonDisconnect]}
-              onPress={disconnectDevice}>
+          </>
+        )}
+        {isConnected && (
+          <TouchableOpacity style={[styles.button, styles.buttonDisconnect]} onPress={handleManualDisconnect}>
               <Text style={styles.buttonText}>Disconnect</Text>
             </TouchableOpacity>
           )}
         </View>
 
-        {!connectedDevice && (
-          <View style={styles.section}>
-            <Text style={styles.sectionTitle}>
-              Scanning for Arduino Device...
+      {/* Server URL Editor */}
+      <View style={styles.urlSection}>
+        <TouchableOpacity 
+          style={styles.urlHeader}
+          onPress={() => setShowUrlEditor(!showUrlEditor)}>
+          <Text style={styles.urlHeaderText}>
+            {showUrlEditor ? '▼' : '▶'} Server URL
+          </Text>
+          {serverUrl && (
+            <Text style={styles.urlPreview} numberOfLines={1}>
+              {serverUrl}
             </Text>
-            {devices.length > 0 && (
-              <View style={styles.deviceItem}>
-                <Text style={styles.deviceName}>
-                  {devices[0].name || 'Arduino Device'}
+          )}
+        </TouchableOpacity>
+        
+        {showUrlEditor && (
+          <View style={styles.urlEditor}>
+            <TextInput
+              style={styles.urlInput}
+              value={serverUrl}
+              onChangeText={setServerUrl}
+              placeholder="Enter server URL (e.g., https://your-server.com/number)"
+              placeholderTextColor="#999"
+              autoCapitalize="none"
+              autoCorrect={false}
+              keyboardType="url"
+            />
+            <View style={styles.urlButtons}>
+              <TouchableOpacity
+                style={[styles.urlButton, styles.urlButtonReset]}
+                onPress={() => setServerUrl(DEFAULT_NGROK_SERVER_URL)}>
+                <Text style={styles.urlButtonText}>Reset</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.urlButton, styles.urlButtonSave]}
+                onPress={() => {
+                  setShowUrlEditor(false);
+                  Alert.alert('Success', 'Server URL updated');
+                }}>
+                <Text style={[styles.urlButtonText, styles.urlButtonSaveText]}>Save</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
+      </View>
+
+      {/* Info Banner */}
+      {isConnected && (
+        <View style={styles.infoBanner}>
+          <Text style={styles.infoText}>
+            ℹ️ ESP32 will disconnect to sleep for 10s, then advertise for 20s. Auto-reconnecting...
                 </Text>
-                <Text style={styles.deviceId}>{devices[0].id}</Text>
-                <Text style={styles.deviceRssi}>RSSI: {devices[0].rssi}</Text>
-              </View>
-            )}
           </View>
         )}
 
-        {connectedDevice && (
-          <View style={styles.section}>
-            <Text style={styles.sectionTitle}>
-              Random Number Stream ({randomNumbers.length})
-            </Text>
+      {/* Forward Status */}
+      {(lastForwardedValue !== null || forwardError) && (
+        <View style={styles.forwardStatus}>
             {lastForwardedValue !== null && (
-              <View style={styles.statusItem}>
-                <Text style={styles.statusText}>
-                  ✅ Last forwarded: {lastForwardedValue} → {NGROK_SERVER_URL}
+            <View style={styles.successStatus}>
+              <Text style={styles.successText}>
+                ✅ Last forwarded: {lastForwardedValue}
                 </Text>
               </View>
             )}
             {forwardError && (
-              <View style={[styles.statusItem, styles.errorItem]}>
+            <View style={styles.errorStatus}>
                 <Text style={styles.errorText}>
                   ❌ Forward error: {forwardError}
                 </Text>
               </View>
             )}
+        </View>
+      )}
+
+      {/* Data Stream */}
+      <View style={styles.dataSection}>
+        <View style={styles.sectionHeader}>
+          <Text style={styles.sectionTitle}>
+            Random Number Stream
+          </Text>
+          <Text style={styles.countText}>{randomNumbers.length} values</Text>
+        </View>
+
             {randomNumbers.length === 0 ? (
-              <View style={styles.dataItem}>
-                <Text style={styles.dataText}>Waiting for data...</Text>
+          <View style={styles.emptyState}>
+            <Text style={styles.emptyText}>
+              {isConnected ? 'Waiting for data...' : 'No data received yet'}
+            </Text>
               </View>
             ) : (
               <ScrollView 
@@ -342,19 +460,14 @@ const App = () => {
                   
                   return (
                     <View key={index} style={styles.dataItem}>
-                      <Text style={styles.dataText}>
                         <Text style={styles.timestampText}>{timeString}</Text>
-                        {' → '}
                         <Text style={styles.valueText}>{data.value}</Text>
-                      </Text>
                     </View>
                   );
                 })}
               </ScrollView>
             )}
           </View>
-        )}
-      </ScrollView>
     </SafeAreaView>
   );
 };
@@ -374,20 +487,34 @@ const styles = StyleSheet.create({
     fontSize: 24,
     fontWeight: 'bold',
     color: '#333',
+    marginBottom: 12,
   },
-  subtitle: {
+  statusContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  statusIndicator: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    marginRight: 8,
+  },
+  statusText: {
     fontSize: 14,
     color: '#666',
+    flex: 1,
+  },
+  deviceId: {
+    fontSize: 11,
+    color: '#999',
+    fontFamily: 'monospace',
     marginTop: 4,
   },
-  content: {
-    flex: 1,
+  controls: {
     padding: 16,
-  },
-  buttonContainer: {
     flexDirection: 'row',
     gap: 10,
-    marginBottom: 20,
   },
   button: {
     flex: 1,
@@ -407,38 +534,152 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '600',
   },
-  section: {
-    marginBottom: 20,
+  urlSection: {
+    marginHorizontal: 16,
+    marginBottom: 16,
+    backgroundColor: '#fff',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#e0e0e0',
+  },
+  urlHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: 12,
+  },
+  urlHeaderText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#333',
+  },
+  urlPreview: {
+    flex: 1,
+    fontSize: 11,
+    color: '#999',
+    marginLeft: 8,
+    textAlign: 'right',
+    fontFamily: 'monospace',
+  },
+  urlEditor: {
+    padding: 12,
+    borderTopWidth: 1,
+    borderTopColor: '#e0e0e0',
+  },
+  urlInput: {
+    backgroundColor: '#f5f5f5',
+    borderWidth: 1,
+    borderColor: '#ddd',
+    borderRadius: 6,
+    padding: 12,
+    fontSize: 14,
+    color: '#333',
+    marginBottom: 12,
+    fontFamily: 'monospace',
+  },
+  urlButtons: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  urlButton: {
+    flex: 1,
+    padding: 10,
+    borderRadius: 6,
+    alignItems: 'center',
+  },
+  urlButtonReset: {
+    backgroundColor: '#f5f5f5',
+    borderWidth: 1,
+    borderColor: '#ddd',
+  },
+  urlButtonSave: {
+    backgroundColor: '#007AFF',
+  },
+  urlButtonText: {
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  urlButtonSaveText: {
+    color: '#fff',
+  },
+  infoBanner: {
+    backgroundColor: '#E3F2FD',
+    padding: 12,
+    marginHorizontal: 16,
+    marginBottom: 16,
+    borderRadius: 8,
+    borderLeftWidth: 4,
+    borderLeftColor: '#2196F3',
+  },
+  infoText: {
+    fontSize: 12,
+    color: '#1565C0',
+  },
+  forwardStatus: {
+    paddingHorizontal: 16,
+    marginBottom: 16,
+  },
+  successStatus: {
+    backgroundColor: '#E8F5E9',
+    padding: 10,
+    borderRadius: 8,
+    marginBottom: 8,
+    borderLeftWidth: 3,
+    borderLeftColor: '#4CAF50',
+  },
+  successText: {
+    fontSize: 12,
+    color: '#2E7D32',
+    fontFamily: 'monospace',
+  },
+  errorStatus: {
+    backgroundColor: '#FFEBEE',
+    padding: 10,
+    borderRadius: 8,
+    borderLeftWidth: 3,
+    borderLeftColor: '#F44336',
+  },
+  errorText: {
+    fontSize: 12,
+    color: '#C62828',
+    fontFamily: 'monospace',
+  },
+  dataSection: {
+    flex: 1,
+    padding: 16,
+  },
+  sectionHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
   },
   sectionTitle: {
     fontSize: 18,
     fontWeight: '600',
     color: '#333',
-    marginBottom: 12,
   },
-  deviceItem: {
-    backgroundColor: '#fff',
-    padding: 15,
-    borderRadius: 8,
-    marginBottom: 10,
-    borderWidth: 1,
-    borderColor: '#e0e0e0',
-  },
-  deviceName: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#333',
-  },
-  deviceId: {
-    fontSize: 12,
+  countText: {
+    fontSize: 14,
     color: '#666',
-    marginTop: 4,
-    fontFamily: 'monospace',
+    fontWeight: '500',
   },
-  deviceRssi: {
-    fontSize: 12,
+  emptyState: {
+    backgroundColor: '#fff',
+    padding: 40,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  emptyText: {
+    fontSize: 14,
     color: '#999',
-    marginTop: 2,
+  },
+  streamContainer: {
+    flex: 1,
+    backgroundColor: '#f9f9f9',
+    borderRadius: 8,
+    padding: 8,
   },
   dataItem: {
     backgroundColor: '#fff',
@@ -447,47 +688,19 @@ const styles = StyleSheet.create({
     marginBottom: 8,
     borderLeftWidth: 3,
     borderLeftColor: '#34C759',
-  },
-  dataText: {
-    fontSize: 14,
-    color: '#333',
-    fontFamily: 'monospace',
-  },
-  streamContainer: {
-    maxHeight: 400,
-    backgroundColor: '#f9f9f9',
-    borderRadius: 8,
-    padding: 8,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
   },
   timestampText: {
+    fontSize: 12,
     color: '#666',
-    fontSize: 12,
-  },
-  valueText: {
-    color: '#007AFF',
-    fontSize: 16,
-    fontWeight: '600',
-  },
-  statusItem: {
-    backgroundColor: '#E8F5E9',
-    padding: 10,
-    borderRadius: 8,
-    marginBottom: 8,
-    borderLeftWidth: 3,
-    borderLeftColor: '#4CAF50',
-  },
-  statusText: {
-    fontSize: 12,
-    color: '#2E7D32',
     fontFamily: 'monospace',
   },
-  errorItem: {
-    backgroundColor: '#FFEBEE',
-    borderLeftColor: '#F44336',
-  },
-  errorText: {
-    fontSize: 12,
-    color: '#C62828',
+  valueText: {
+    fontSize: 18,
+    color: '#007AFF',
+    fontWeight: '600',
     fontFamily: 'monospace',
   },
 });
