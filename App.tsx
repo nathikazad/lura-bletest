@@ -1,473 +1,440 @@
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   SafeAreaView,
-  ScrollView,
   StatusBar,
   StyleSheet,
   Text,
-  TextInput,
-  TouchableOpacity,
   View,
+  TouchableOpacity,
+  FlatList,
+  ActivityIndicator,
   Alert,
+  PermissionsAndroid,
+  Platform,
 } from 'react-native';
-import { BleManager, Device } from 'react-native-ble-plx';
-import { Buffer } from 'buffer';
-import { createBleManager } from './src/services/BleService';
-
-// ESP32 device constants
-const ESP32_SERVICE_UUID = '19B10000-E8F2-537E-4F6C-D104768A1214';
-const ESP32_CHARACTERISTIC_UUID = '19B10001-E8F2-537E-4F6C-D104768A1214';
-const ESP32_DEVICE_NAME = 'RandomNumber';
-
-// Default Ngrok server URL
-const DEFAULT_NGROK_SERVER_URL = 'https://885bd333b988.ngrok-free.app/number';
-
-interface RandomNumberData {
-  timestamp: string;
-  value: number;
-}
+import { Device } from 'react-native-ble-plx';
+import {
+  getBleManager,
+  scanForDevices,
+  stopScan,
+  connectToDevice,
+  disconnectFromDevice,
+  monitorConnection,
+  monitorCharacteristic,
+  isPairingMismatchError,
+  clearDeviceConnectionState,
+  ScanResult,
+  DEVICE_NAME,
+} from './src/services/BleService';
 
 const App = () => {
-  const [isConnected, setIsConnected] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
-  const [randomNumbers, setRandomNumbers] = useState<RandomNumberData[]>([]);
-  const [lastForwardedValue, setLastForwardedValue] = useState<number | null>(null);
-  const [forwardError, setForwardError] = useState<string | null>(null);
-  const [connectionStatus, setConnectionStatus] = useState<string>('Not connected');
-  const [deviceId, setDeviceId] = useState<string | null>(null);
-  const [serverUrl, setServerUrl] = useState<string>(DEFAULT_NGROK_SERVER_URL);
-  const [showUrlEditor, setShowUrlEditor] = useState(false);
-  
-  const bleManager = useRef<BleManager>(createBleManager()).current;
-  const connectedDeviceRef = useRef<Device | null>(null);
-  const isConnectingRef = useRef(false);
+  const [devices, setDevices] = useState<ScanResult[]>([]);
+  const [connectedDevice, setConnectedDevice] = useState<Device | null>(null);
+  const [numberStream, setNumberStream] = useState<string[]>([]);
+  const [connectionStatus, setConnectionStatus] = useState<string>('Disconnected');
+  const [monitorCleanup, setMonitorCleanup] = useState<(() => void) | null>(null);
 
   useEffect(() => {
-    // Check if Bluetooth is enabled
-    bleManager.state().then((state) => {
-      if (state !== 'PoweredOn') {
-        Alert.alert('Bluetooth', 'Please enable Bluetooth to use this app');
-      }
-    });
+    // Request permissions on Android
+    if (Platform.OS === 'android') {
+      requestPermissions();
+    }
 
-    // Listen for state changes
-    const subscription = bleManager.onStateChange((state) => {
-      if (state === 'PoweredOn') {
-        console.log('Bluetooth is powered on');
-        // Auto-start scanning when Bluetooth is enabled
-        if (!isConnected && !isScanning) {
-          startReconnectionScan();
-        }
+    // Initialize BLE manager
+    const manager = getBleManager();
+    
+    // Monitor BLE state
+    const subscription = manager.onStateChange((state) => {
+      console.log('BLE State:', state);
+      if (state === 'PoweredOff') {
+        Alert.alert(
+          'Bluetooth Off',
+          'Please enable Bluetooth to use this app.'
+        );
       }
-    });
-
-    // Auto-start scanning on mount
-    startReconnectionScan();
+    }, true);
 
     return () => {
       subscription.remove();
-      bleManager.stopDeviceScan();
+      stopScan();
+      // Clean up notification monitor if it exists
+      if (monitorCleanup) {
+        monitorCleanup();
+      }
     };
+  }, [monitorCleanup]);
+
+  const requestPermissions = async () => {
+    if (Platform.OS === 'android') {
+      try {
+        const granted = await PermissionsAndroid.requestMultiple([
+          PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+          PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+        ]);
+        
+        if (
+          granted['android.permission.BLUETOOTH_SCAN'] !== PermissionsAndroid.RESULTS.GRANTED ||
+          granted['android.permission.BLUETOOTH_CONNECT'] !== PermissionsAndroid.RESULTS.GRANTED
+        ) {
+          Alert.alert('Permissions Required', 'Bluetooth permissions are required to scan for devices.');
+          return false;
+        }
+        return true;
+      } catch (err) {
+        console.warn(err);
+        return false;
+      }
+    }
+    return true;
+  };
+
+  const handleDeviceFound = useCallback((device: ScanResult) => {
+    setDevices((prevDevices) => {
+      // Avoid duplicates
+      const exists = prevDevices.find((d) => d.id === device.id);
+      if (exists) {
+        return prevDevices;
+      }
+      return [...prevDevices, device];
+    });
   }, []);
 
-  const startReconnectionScan = () => {
-    if (isScanning || isConnectingRef.current) {
+  const startScan = async () => {
+    const hasPermission = await requestPermissions();
+    if (!hasPermission && Platform.OS === 'android') {
       return;
     }
 
-    console.log('Starting reconnection scan for ESP32 device...');
+    setDevices([]);
     setIsScanning(true);
-    setConnectionStatus('Scanning for ESP32...');
+    setConnectionStatus('Scanning...');
 
-    bleManager.startDeviceScan(
-      [ESP32_SERVICE_UUID], // Service UUID filter for background scanning
-      { allowDuplicates: true }, // Allow duplicates to catch every advertising window
-      (error, device) => {
-        if (error) {
-          console.error('Scan error:', error);
-          return;
-        }
+    try {
+      await scanForDevices(handleDeviceFound, 10000);
+    } catch (error: any) {
+      console.error('Scan error:', error);
+      Alert.alert('Scan Error', error.message || 'Failed to start scanning');
+      setIsScanning(false);
+      setConnectionStatus('Scan Failed');
+    }
 
-        if (device && !isConnected && !isConnectingRef.current) {
-          console.log('ESP32 device detected:', {
-              name: device.name,
-              id: device.id,
-          });
-          connectToDevice(device);
-        }
+    // Stop scanning after timeout
+    setTimeout(() => {
+      stopScan();
+      setIsScanning(false);
+      if (devices.length === 0) {
+        setConnectionStatus('No devices found');
+      } else {
+        setConnectionStatus('Scan complete');
       }
-    );
+    }, 10000);
   };
 
-  const handleCharacteristicValue = (value: string | null) => {
-    if (!value) return;
+  const handleConnect = async (deviceId: string, isRetry: boolean = false) => {
+    console.log('[App] handleConnect() called');
+    console.log('[App] Device ID:', deviceId);
+    console.log('[App] Is retry:', isRetry);
     
     try {
-      const base64Value = value;
-      const buffer = Buffer.from(base64Value, 'base64');
-      const randomValue = buffer.readUInt8(0);
-      
-      const timestamp = new Date().toISOString();
-      const data: RandomNumberData = {
-        timestamp,
-        value: randomValue,
-      };
-      
-      setRandomNumbers((prev) => [data, ...prev]);
-      console.log('Received random number:', randomValue);
-      
-      // Forward to server
-      forwardToServer(randomValue);
-    } catch (parseError) {
-      console.error('Error parsing random number:', parseError);
-    }
-  };
+      if (!isRetry) {
+        console.log('[App] Updating UI state: Connecting...');
+        setConnectionStatus('Connecting...');
+        console.log('[App] Stopping scan...');
+        stopScan();
+        setIsScanning(false);
+        console.log('[App] Scan stopped, UI updated');
+      } else {
+        console.log('[App] Retry attempt - clearing connection state first...');
+        setConnectionStatus('Clearing pairing...');
+        await clearDeviceConnectionState(deviceId);
+        // Wait a bit longer for iOS to clear the pairing state
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        setConnectionStatus('Reconnecting...');
+      }
 
-  const connectToDevice = async (device: Device) => {
-    if (isConnectingRef.current) {
-      return;
-    }
-
-    isConnectingRef.current = true;
-    setIsScanning(false);
-    setConnectionStatus('Connecting...');
-    bleManager.stopDeviceScan();
-
-    let deviceConnection: Device | null = null;
-
-    try {
-      deviceConnection = await device.connect();
-      connectedDeviceRef.current = deviceConnection;
-      setIsConnected(true);
-      setDeviceId(device.id);
-      setConnectionStatus(`Connected: ${device.name || device.id}`);
-
-      // Monitor device disconnection FIRST (before any async operations)
-      deviceConnection.onDisconnected((error, device) => {
-        console.log('Device disconnected (expected - ESP32 sleeping):', device?.id, error?.message);
-        connectedDeviceRef.current = null;
-        setIsConnected(false);
-        setConnectionStatus('Disconnected - Waiting for ESP32 to wake up...');
-        isConnectingRef.current = false;
-        
-        // Start scanning again to catch when device wakes up
-        setTimeout(() => {
-          startReconnectionScan();
-        }, 500);
+      console.log('[App] Calling connectToDevice()...');
+      const device = await connectToDevice(deviceId);
+      console.log('[App] Device connected successfully');
+      console.log('[App] Connected device info:', {
+        id: device.id,
+        name: device.name,
+        rssi: device.rssi,
       });
-
-      // Discover services and characteristics
-      await deviceConnection.discoverAllServicesAndCharacteristics();
-
-      // Find and subscribe to the random number characteristic
-      const services = await deviceConnection.services();
       
-      for (const service of services) {
-        if (service.uuid.toLowerCase() === ESP32_SERVICE_UUID.toLowerCase()) {
-          const characteristics = await service.characteristics();
-          
-          for (const characteristic of characteristics) {
-            if (characteristic.uuid.toLowerCase() === ESP32_CHARACTERISTIC_UUID.toLowerCase()) {
-              // Read initial value first (ESP32 sends immediately on connection)
-              try {
-                const initialValue = await characteristic.read();
-                if (initialValue?.value) {
-                  console.log('Read initial characteristic value');
-                  handleCharacteristicValue(initialValue.value);
-                }
-              } catch (readError) {
-                console.log('Could not read initial value (may not be available):', readError);
-              }
+      setConnectedDevice(device);
+      setConnectionStatus('Connected');
+      console.log('[App] UI updated: device set, status=Connected');
 
-              // Then set up monitoring for notifications
-              if (characteristic.isNotifiable || characteristic.isIndicatable) {
-                try {
-                  await characteristic.monitor((error, char) => {
-                    if (error) {
-                      // Don't log disconnection errors as errors - they're expected
-                      if (error.message?.includes('disconnected')) {
-                        console.log('Monitor stopped due to disconnection (expected)');
-                        return;
-                      }
-                      console.error('Characteristic monitor error:', error);
-                      return;
-                    }
-
-                    if (char?.value) {
-                      handleCharacteristicValue(char.value);
-                    }
-                  });
-                  console.log('Subscribed to random number characteristic notifications');
-                } catch (err: any) {
-                  console.error('Could not monitor characteristic:', err);
-                  // Don't show alert for expected disconnections
-                  if (!err?.message?.includes('disconnected')) {
-                    Alert.alert('Error', 'Could not subscribe to random number characteristic');
-                  }
-                }
-              } else {
-                // If not notifiable, try reading periodically
-                console.log('Characteristic is not notifiable, will read periodically');
-                const readInterval = setInterval(async () => {
-                  if (!connectedDeviceRef.current || !isConnected) {
-                    clearInterval(readInterval);
-                    return;
-                  }
-                  try {
-                    const value = await characteristic.read();
-                    if (value?.value) {
-                      handleCharacteristicValue(value.value);
-                    }
-                  } catch (err) {
-                    clearInterval(readInterval);
-                  }
-                }, 1000);
-              }
-            }
+      // Monitor connection state
+      console.log('[App] Setting up connection monitoring...');
+      monitorConnection(device, (connected) => {
+        console.log('[App] Connection state changed callback triggered');
+        console.log('[App] Connected:', connected);
+        setConnectionStatus(connected ? 'Connected' : 'Disconnected');
+        if (!connected) {
+          console.log('[App] Device disconnected, clearing state');
+          setConnectedDevice(null);
+          setNumberStream([]);
+          // Clean up notification monitor
+          if (monitorCleanup) {
+            monitorCleanup();
+            setMonitorCleanup(null);
           }
         }
-      }
-
-      isConnectingRef.current = false;
-    } catch (error: any) {
-      // Check if error is due to disconnection (expected behavior)
-      const errorMessage = error?.message || '';
-      const isDisconnectionError = 
-        errorMessage.includes('disconnected') || 
-        errorMessage.includes('Device was disconnected');
-      
-      if (isDisconnectionError) {
-        console.log('Connection interrupted by disconnection (expected - ESP32 sleeping)');
-        setConnectionStatus('Disconnected - Waiting for ESP32 to wake up...');
-      } else {
-        console.error('Connection error:', error);
-        setConnectionStatus('Connection failed - Retrying...');
-      }
-      
-      setIsConnected(false);
-      connectedDeviceRef.current = null;
-      isConnectingRef.current = false;
-      
-      // Retry connection after a short delay
-      setTimeout(() => {
-        startReconnectionScan();
-      }, 2000);
-    }
-  };
-
-  const forwardToServer = async (number: number) => {
-    if (!serverUrl || serverUrl.trim() === '') {
-      console.log('Server URL not set, skipping forward');
-      return;
-    }
-
-    try {
-      const response = await fetch(serverUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'ngrok-skip-browser-warning': 'true',
-        },
-        body: JSON.stringify({ number }),
       });
+      console.log('[App] Connection monitoring set up');
 
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-
-      const result = await response.json();
-      console.log('Successfully forwarded to server:', result);
-      setLastForwardedValue(number);
-      setForwardError(null);
+      // iOS will automatically show pairing dialog if needed
+      // Wait a bit for pairing to complete, then start monitoring notifications
+      console.log('[App] Waiting 2 seconds for pairing to complete, then starting notification monitoring...');
+      setTimeout(() => {
+        console.log('[App] Timeout reached, starting notification monitoring');
+        startMonitoringNotifications(device);
+      }, 2000);
     } catch (error: any) {
-      console.error('Error forwarding to server:', error);
-      setForwardError(error.message || 'Failed to forward to server');
-    }
-  };
-
-  const handleManualDisconnect = async () => {
-    if (connectedDeviceRef.current) {
-      try {
-        await connectedDeviceRef.current.cancelConnection();
-        connectedDeviceRef.current = null;
-        setIsConnected(false);
-        setConnectionStatus('Manually disconnected');
-        isConnectingRef.current = false;
-        // Don't auto-reconnect after manual disconnect
-        bleManager.stopDeviceScan();
-        setIsScanning(false);
-      } catch (error: any) {
-        console.error('Disconnect error:', error);
+      console.error('[App] Connection error:', error);
+      console.error('[App] Connection error details:', JSON.stringify(error, null, 2));
+      if (error instanceof Error) {
+        console.error('[App] Error message:', error.message);
+        console.error('[App] Error stack:', error.stack);
       }
+      
+      const errorMessage = error.message || 'Failed to connect';
+      console.log('[App] Error message:', errorMessage);
+      
+      // Check for pairing mismatch
+      if (isPairingMismatchError(error)) {
+        console.log('[App] Pairing mismatch detected');
+        
+        if (!isRetry) {
+          console.log('[App] Attempting automatic retry after clearing pairing state...');
+          // Automatically retry once after clearing pairing state
+          try {
+            await handleConnect(deviceId, true);
+            return; // Success, exit early
+          } catch (retryError: any) {
+            console.error('[App] Retry also failed:', retryError);
+            // Fall through to show error message
+          }
+        }
+        
+        // If retry failed or this was already a retry, show user guidance
+        Alert.alert(
+          'Pairing Mismatch',
+          'The device has cleared its pairing information. iOS may need to forget the old pairing.\n\n' +
+          'Please try:\n' +
+          '1. Go to iOS Settings > Bluetooth\n' +
+          '2. Find "BLE Auth Server" and tap the (i) icon\n' +
+          '3. Tap "Forget This Device"\n' +
+          '4. Try connecting again\n\n' +
+          'Or tap "Retry" to attempt automatic recovery.',
+          [
+            { text: 'Cancel', style: 'cancel' },
+            {
+              text: 'Retry',
+              onPress: () => {
+                console.log('[App] User requested retry');
+                handleConnect(deviceId, true);
+              },
+            },
+          ]
+        );
+      } else if (errorMessage.includes('authentication') || errorMessage.includes('authorization')) {
+        console.log('[App] Authentication/authorization error detected');
+        Alert.alert(
+          'Pairing Required',
+          'Please enter passkey 123456 when prompted to pair with the device.',
+          [{ text: 'OK' }]
+        );
+      } else {
+        console.log('[App] Generic connection error');
+        Alert.alert('Connection Error', errorMessage);
+      }
+      
+      setConnectionStatus('Connection Failed');
+      setConnectedDevice(null);
+      console.log('[App] UI updated: connection failed');
     }
   };
 
-  const handleStartScan = () => {
-    if (!isScanning && !isConnected) {
-      startReconnectionScan();
+  const startMonitoringNotifications = (device: Device) => {
+    console.log('[App] startMonitoringNotifications() called');
+    console.log('[App] Device ID:', device.id);
+    
+    // Clear existing stream
+    setNumberStream([]);
+    
+    // Clean up any existing monitor
+    if (monitorCleanup) {
+      monitorCleanup();
+    }
+    
+    // Start monitoring notifications
+    const cleanup = monitorCharacteristic(device, (value: string) => {
+      console.log('[App] Received notification value:', value);
+      setNumberStream((prev) => {
+        // Keep last 50 numbers to avoid memory issues
+        const updated = [value, ...prev];
+        return updated.slice(0, 50);
+      });
+      setConnectionStatus('Receiving data...');
+    });
+    
+    setMonitorCleanup(() => cleanup);
+    setConnectionStatus('Monitoring notifications...');
+    console.log('[App] Notification monitoring started');
+  };
+
+  const handleDisconnect = async () => {
+    console.log('[App] handleDisconnect() called');
+    console.log('[App] Connected device:', connectedDevice ? {
+      id: connectedDevice.id,
+      name: connectedDevice.name,
+    } : 'null');
+    
+    if (connectedDevice) {
+      try {
+        console.log('[App] Calling disconnectFromDevice()...');
+        await disconnectFromDevice(connectedDevice);
+        console.log('[App] Device disconnected successfully');
+        
+        console.log('[App] Clearing UI state');
+        setConnectedDevice(null);
+        setNumberStream([]);
+        setConnectionStatus('Disconnected');
+        console.log('[App] UI updated: device cleared, status=Disconnected');
+        
+        // Clean up notification monitor
+        if (monitorCleanup) {
+          monitorCleanup();
+          setMonitorCleanup(null);
+        }
+      } catch (error: any) {
+        console.error('[App] Disconnect error:', error);
+        console.error('[App] Disconnect error details:', JSON.stringify(error, null, 2));
+        if (error instanceof Error) {
+          console.error('[App] Error message:', error.message);
+          console.error('[App] Error stack:', error.stack);
+        }
+        Alert.alert('Disconnect Error', error.message || 'Failed to disconnect');
+      }
+    } else {
+      console.log('[App] No device connected, nothing to disconnect');
     }
   };
 
-  const handleStopScan = () => {
-    bleManager.stopDeviceScan();
-    setIsScanning(false);
-    setConnectionStatus('Scanning stopped');
-  };
+  const renderDevice = ({ item }: { item: ScanResult }) => (
+    <TouchableOpacity
+      style={styles.deviceItem}
+      onPress={() => handleConnect(item.id)}
+      disabled={!!connectedDevice}
+    >
+      <View style={styles.deviceInfo}>
+        <Text style={styles.deviceName}>{item.name || 'Unknown Device'}</Text>
+        <Text style={styles.deviceId}>{item.id}</Text>
+        {item.rssi !== null && (
+          <Text style={styles.deviceRssi}>RSSI: {item.rssi} dBm</Text>
+        )}
+      </View>
+      {connectedDevice?.id === item.id && (
+        <View style={styles.connectedBadge}>
+          <Text style={styles.connectedText}>Connected</Text>
+        </View>
+      )}
+    </TouchableOpacity>
+  );
 
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="dark-content" />
       
-      {/* Header */}
-      <View style={styles.header}>
-        <Text style={styles.title}>ESP32 Random Number Monitor</Text>
-        <View style={styles.statusContainer}>
-          <View style={[
-            styles.statusIndicator,
-            { backgroundColor: isConnected ? '#4CAF50' : isScanning ? '#FF9800' : '#9E9E9E' }
-          ]} />
-          <Text style={styles.statusText}>{connectionStatus}</Text>
-        </View>
-        {deviceId && (
-          <Text style={styles.deviceId}>Device ID: {deviceId}</Text>
-        )}
-      </View>
+      <View style={styles.content}>
+        <Text style={styles.title}>BLE Scanner</Text>
+        <Text style={styles.subtitle}>ESP32 Authorization Server</Text>
 
-      {/* Controls */}
-      <View style={styles.controls}>
-        {!isConnected && (
+        <View style={styles.statusContainer}>
+          <Text style={styles.statusText}>Status: {connectionStatus}</Text>
+        </View>
+
+        {!connectedDevice ? (
           <>
-          {!isScanning ? (
-              <TouchableOpacity style={styles.button} onPress={handleStartScan}>
-              <Text style={styles.buttonText}>Start Scan</Text>
+            <TouchableOpacity
+              style={[styles.button, isScanning && styles.buttonDisabled]}
+              onPress={startScan}
+              disabled={isScanning}
+            >
+              {isScanning ? (
+                <ActivityIndicator color="#fff" />
+              ) : (
+                <Text style={styles.buttonText}>Start Scan</Text>
+              )}
             </TouchableOpacity>
-          ) : (
-              <TouchableOpacity style={[styles.button, styles.buttonStop]} onPress={handleStopScan}>
-              <Text style={styles.buttonText}>Stop Scan</Text>
-            </TouchableOpacity>
-          )}
+
+            {devices.length > 0 && (
+              <View style={styles.devicesContainer}>
+                <Text style={styles.sectionTitle}>Found Devices:</Text>
+                <FlatList
+                  data={devices}
+                  renderItem={renderDevice}
+                  keyExtractor={(item) => item.id}
+                  style={styles.devicesList}
+                />
+              </View>
+            )}
           </>
-        )}
-        {isConnected && (
-          <TouchableOpacity style={[styles.button, styles.buttonDisconnect]} onPress={handleManualDisconnect}>
+        ) : (
+          <View style={styles.connectedContainer}>
+            <View style={styles.deviceInfo}>
+              <Text style={styles.connectedDeviceName}>
+                {connectedDevice.name || 'Connected Device'}
+              </Text>
+              <Text style={styles.connectedDeviceId}>{connectedDevice.id}</Text>
+            </View>
+
+            <View style={styles.streamContainer}>
+              <Text style={styles.streamTitle}>Random Number Stream:</Text>
+              {numberStream.length > 0 ? (
+                <FlatList
+                  data={numberStream}
+                  renderItem={({ item, index }) => (
+                    <View style={styles.streamItem}>
+                      <Text style={styles.streamNumber}>{item}</Text>
+                      {index === 0 && (
+                        <View style={styles.newBadge}>
+                          <Text style={styles.newBadgeText}>NEW</Text>
+                        </View>
+                      )}
+                    </View>
+                  )}
+                  keyExtractor={(item, index) => `${item}-${index}`}
+                  style={styles.streamList}
+                  inverted
+                />
+              ) : (
+                <View style={styles.emptyStream}>
+                  <Text style={styles.emptyStreamText}>Waiting for numbers...</Text>
+                </View>
+              )}
+            </View>
+
+            <TouchableOpacity
+              style={[styles.button, styles.disconnectButton]}
+              onPress={handleDisconnect}
+            >
               <Text style={styles.buttonText}>Disconnect</Text>
             </TouchableOpacity>
-          )}
-        </View>
 
-      {/* Server URL Editor */}
-      <View style={styles.urlSection}>
-        <TouchableOpacity 
-          style={styles.urlHeader}
-          onPress={() => setShowUrlEditor(!showUrlEditor)}>
-          <Text style={styles.urlHeaderText}>
-            {showUrlEditor ? '▼' : '▶'} Server URL
-          </Text>
-          {serverUrl && (
-            <Text style={styles.urlPreview} numberOfLines={1}>
-              {serverUrl}
-            </Text>
-          )}
-        </TouchableOpacity>
-        
-        {showUrlEditor && (
-          <View style={styles.urlEditor}>
-            <TextInput
-              style={styles.urlInput}
-              value={serverUrl}
-              onChangeText={setServerUrl}
-              placeholder="Enter server URL (e.g., https://your-server.com/number)"
-              placeholderTextColor="#999"
-              autoCapitalize="none"
-              autoCorrect={false}
-              keyboardType="url"
-            />
-            <View style={styles.urlButtons}>
-              <TouchableOpacity
-                style={[styles.urlButton, styles.urlButtonReset]}
-                onPress={() => setServerUrl(DEFAULT_NGROK_SERVER_URL)}>
-                <Text style={styles.urlButtonText}>Reset</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.urlButton, styles.urlButtonSave]}
-                onPress={() => {
-                  setShowUrlEditor(false);
-                  Alert.alert('Success', 'Server URL updated');
-                }}>
-                <Text style={[styles.urlButtonText, styles.urlButtonSaveText]}>Save</Text>
-              </TouchableOpacity>
+            <View style={styles.infoBox}>
+              <Text style={styles.infoText}>
+                The ESP32 generates random numbers and sends them every second.
+                Passkey: 123456
+              </Text>
             </View>
           </View>
         )}
       </View>
-
-      {/* Info Banner */}
-      {isConnected && (
-        <View style={styles.infoBanner}>
-          <Text style={styles.infoText}>
-            ℹ️ ESP32 will disconnect to sleep for 10s, then advertise for 20s. Auto-reconnecting...
-                </Text>
-          </View>
-        )}
-
-      {/* Forward Status */}
-      {(lastForwardedValue !== null || forwardError) && (
-        <View style={styles.forwardStatus}>
-            {lastForwardedValue !== null && (
-            <View style={styles.successStatus}>
-              <Text style={styles.successText}>
-                ✅ Last forwarded: {lastForwardedValue}
-                </Text>
-              </View>
-            )}
-            {forwardError && (
-            <View style={styles.errorStatus}>
-                <Text style={styles.errorText}>
-                  ❌ Forward error: {forwardError}
-                </Text>
-              </View>
-            )}
-        </View>
-      )}
-
-      {/* Data Stream */}
-      <View style={styles.dataSection}>
-        <View style={styles.sectionHeader}>
-          <Text style={styles.sectionTitle}>
-            Random Number Stream
-          </Text>
-          <Text style={styles.countText}>{randomNumbers.length} values</Text>
-        </View>
-
-            {randomNumbers.length === 0 ? (
-          <View style={styles.emptyState}>
-            <Text style={styles.emptyText}>
-              {isConnected ? 'Waiting for data...' : 'No data received yet'}
-            </Text>
-              </View>
-            ) : (
-              <ScrollView 
-                style={styles.streamContainer}
-                nestedScrollEnabled={true}
-                showsVerticalScrollIndicator={true}>
-                {randomNumbers.map((data, index) => {
-                  const date = new Date(data.timestamp);
-                  const hours = date.getHours().toString().padStart(2, '0');
-                  const minutes = date.getMinutes().toString().padStart(2, '0');
-                  const seconds = date.getSeconds().toString().padStart(2, '0');
-                  const milliseconds = date.getMilliseconds().toString().padStart(3, '0');
-                  const timeString = `${hours}:${minutes}:${seconds}.${milliseconds}`;
-                  
-                  return (
-                    <View key={index} style={styles.dataItem}>
-                        <Text style={styles.timestampText}>{timeString}</Text>
-                        <Text style={styles.valueText}>{data.value}</Text>
-                    </View>
-                  );
-                })}
-              </ScrollView>
-            )}
-          </View>
     </SafeAreaView>
   );
 };
@@ -477,233 +444,185 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#f5f5f5',
   },
-  header: {
+  content: {
+    flex: 1,
     padding: 20,
-    backgroundColor: '#fff',
-    borderBottomWidth: 1,
-    borderBottomColor: '#e0e0e0',
   },
   title: {
     fontSize: 24,
     fontWeight: 'bold',
     color: '#333',
-    marginBottom: 12,
+    marginBottom: 8,
+    textAlign: 'center',
+  },
+  subtitle: {
+    fontSize: 16,
+    color: '#666',
+    marginBottom: 20,
+    textAlign: 'center',
   },
   statusContainer: {
-    flexDirection: 'row',
+    backgroundColor: '#fff',
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 20,
     alignItems: 'center',
-    marginBottom: 8,
-  },
-  statusIndicator: {
-    width: 12,
-    height: 12,
-    borderRadius: 6,
-    marginRight: 8,
   },
   statusText: {
     fontSize: 14,
-    color: '#666',
-    flex: 1,
-  },
-  deviceId: {
-    fontSize: 11,
-    color: '#999',
-    fontFamily: 'monospace',
-    marginTop: 4,
-  },
-  controls: {
-    padding: 16,
-    flexDirection: 'row',
-    gap: 10,
+    color: '#333',
+    fontWeight: '500',
   },
   button: {
-    flex: 1,
     backgroundColor: '#007AFF',
-    padding: 15,
+    padding: 16,
     borderRadius: 8,
     alignItems: 'center',
+    marginBottom: 16,
   },
-  buttonStop: {
-    backgroundColor: '#FF3B30',
-  },
-  buttonDisconnect: {
-    backgroundColor: '#FF9500',
+  buttonDisabled: {
+    backgroundColor: '#999',
   },
   buttonText: {
     color: '#fff',
     fontSize: 16,
     fontWeight: '600',
   },
-  urlSection: {
-    marginHorizontal: 16,
-    marginBottom: 16,
+  disconnectButton: {
+    backgroundColor: '#FF3B30',
+    marginTop: 20,
+  },
+  streamContainer: {
+    flex: 1,
     backgroundColor: '#fff',
     borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#e0e0e0',
-  },
-  urlHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    padding: 12,
-  },
-  urlHeaderText: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: '#333',
-  },
-  urlPreview: {
-    flex: 1,
-    fontSize: 11,
-    color: '#999',
-    marginLeft: 8,
-    textAlign: 'right',
-    fontFamily: 'monospace',
-  },
-  urlEditor: {
-    padding: 12,
-    borderTopWidth: 1,
-    borderTopColor: '#e0e0e0',
-  },
-  urlInput: {
-    backgroundColor: '#f5f5f5',
-    borderWidth: 1,
-    borderColor: '#ddd',
-    borderRadius: 6,
-    padding: 12,
-    fontSize: 14,
-    color: '#333',
-    marginBottom: 12,
-    fontFamily: 'monospace',
-  },
-  urlButtons: {
-    flexDirection: 'row',
-    gap: 10,
-  },
-  urlButton: {
-    flex: 1,
-    padding: 10,
-    borderRadius: 6,
-    alignItems: 'center',
-  },
-  urlButtonReset: {
-    backgroundColor: '#f5f5f5',
-    borderWidth: 1,
-    borderColor: '#ddd',
-  },
-  urlButtonSave: {
-    backgroundColor: '#007AFF',
-  },
-  urlButtonText: {
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  urlButtonSaveText: {
-    color: '#fff',
-  },
-  infoBanner: {
-    backgroundColor: '#E3F2FD',
-    padding: 12,
-    marginHorizontal: 16,
-    marginBottom: 16,
-    borderRadius: 8,
-    borderLeftWidth: 4,
-    borderLeftColor: '#2196F3',
-  },
-  infoText: {
-    fontSize: 12,
-    color: '#1565C0',
-  },
-  forwardStatus: {
-    paddingHorizontal: 16,
-    marginBottom: 16,
-  },
-  successStatus: {
-    backgroundColor: '#E8F5E9',
-    padding: 10,
-    borderRadius: 8,
-    marginBottom: 8,
-    borderLeftWidth: 3,
-    borderLeftColor: '#4CAF50',
-  },
-  successText: {
-    fontSize: 12,
-    color: '#2E7D32',
-    fontFamily: 'monospace',
-  },
-  errorStatus: {
-    backgroundColor: '#FFEBEE',
-    padding: 10,
-    borderRadius: 8,
-    borderLeftWidth: 3,
-    borderLeftColor: '#F44336',
-  },
-  errorText: {
-    fontSize: 12,
-    color: '#C62828',
-    fontFamily: 'monospace',
-  },
-  dataSection: {
-    flex: 1,
     padding: 16,
+    marginTop: 20,
+    marginBottom: 20,
   },
-  sectionHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
+  streamTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#333',
     marginBottom: 12,
+  },
+  streamList: {
+    flex: 1,
+  },
+  streamItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    backgroundColor: '#f5f5f5',
+    borderRadius: 6,
+    marginBottom: 8,
+  },
+  streamNumber: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#007AFF',
+    fontFamily: 'monospace',
+  },
+  newBadge: {
+    backgroundColor: '#34C759',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 4,
+  },
+  newBadgeText: {
+    color: '#fff',
+    fontSize: 10,
+    fontWeight: '600',
+  },
+  emptyStream: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingVertical: 40,
+  },
+  emptyStreamText: {
+    fontSize: 14,
+    color: '#999',
+    fontStyle: 'italic',
+  },
+  devicesContainer: {
+    flex: 1,
+    marginTop: 20,
   },
   sectionTitle: {
     fontSize: 18,
     fontWeight: '600',
     color: '#333',
+    marginBottom: 12,
   },
-  countText: {
-    fontSize: 14,
-    color: '#666',
-    fontWeight: '500',
-  },
-  emptyState: {
-    backgroundColor: '#fff',
-    padding: 40,
-    borderRadius: 8,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  emptyText: {
-    fontSize: 14,
-    color: '#999',
-  },
-  streamContainer: {
+  devicesList: {
     flex: 1,
-    backgroundColor: '#f9f9f9',
-    borderRadius: 8,
-    padding: 8,
   },
-  dataItem: {
+  deviceItem: {
     backgroundColor: '#fff',
-    padding: 12,
+    padding: 16,
     borderRadius: 8,
-    marginBottom: 8,
-    borderLeftWidth: 3,
-    borderLeftColor: '#34C759',
+    marginBottom: 12,
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
   },
-  timestampText: {
+  deviceInfo: {
+    flex: 1,
+  },
+  deviceName: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#333',
+    marginBottom: 4,
+  },
+  deviceId: {
     fontSize: 12,
     color: '#666',
-    fontFamily: 'monospace',
+    marginBottom: 4,
   },
-  valueText: {
-    fontSize: 18,
-    color: '#007AFF',
+  deviceRssi: {
+    fontSize: 12,
+    color: '#999',
+  },
+  connectedBadge: {
+    backgroundColor: '#34C759',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 12,
+  },
+  connectedText: {
+    color: '#fff',
+    fontSize: 12,
     fontWeight: '600',
-    fontFamily: 'monospace',
+  },
+  connectedContainer: {
+    flex: 1,
+  },
+  connectedDeviceName: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#333',
+    marginBottom: 4,
+  },
+  connectedDeviceId: {
+    fontSize: 12,
+    color: '#666',
+    marginBottom: 20,
+  },
+  infoBox: {
+    backgroundColor: '#E3F2FD',
+    padding: 12,
+    borderRadius: 8,
+    marginTop: 20,
+  },
+  infoText: {
+    fontSize: 12,
+    color: '#1976D2',
+    lineHeight: 18,
   },
 });
 
 export default App;
-
