@@ -28,12 +28,13 @@ import {
 } from './src/services/BleService';
 
 const App = () => {
-  const [isScanning, setIsScanning] = useState(false);
+  // Three states: 'scanning-no-paired' | 'scanning-for-paired' | 'connected'
+  const [appState, setAppState] = useState<'scanning-no-paired' | 'scanning-for-paired' | 'connected'>('scanning-no-paired');
   const [devices, setDevices] = useState<ScanResult[]>([]);
   const [connectedDevice, setConnectedDevice] = useState<Device | null>(null);
   const [numberStream, setNumberStream] = useState<string[]>([]);
-  const [connectionStatus, setConnectionStatus] = useState<string>('Disconnected');
   const [monitorCleanup, setMonitorCleanup] = useState<(() => void) | null>(null);
+  const [pairedDeviceId, setPairedDeviceId] = useState<string | null>(null);
 
   useEffect(() => {
     // Request permissions on Android
@@ -52,8 +53,26 @@ const App = () => {
           'Bluetooth Off',
           'Please enable Bluetooth to use this app.'
         );
+      } else if (state === 'PoweredOn') {
+        // Start scanning automatically when Bluetooth is powered on
+        if (appState === 'scanning-no-paired' || appState === 'scanning-for-paired') {
+          startScan();
+        }
       }
     }, true);
+
+    // Start scanning automatically on mount if Bluetooth is on
+    const initScan = async () => {
+      try {
+        const state = await manager.state();
+        if (state === 'PoweredOn' && (appState === 'scanning-no-paired' || appState === 'scanning-for-paired')) {
+          startScan();
+        }
+      } catch (error) {
+        console.error('Error checking BLE state:', error);
+      }
+    };
+    initScan();
 
     return () => {
       subscription.remove();
@@ -63,7 +82,7 @@ const App = () => {
         monitorCleanup();
       }
     };
-  }, [monitorCleanup]);
+  }, [monitorCleanup, appState]);
 
   const requestPermissions = async () => {
     if (Platform.OS === 'android') {
@@ -91,45 +110,58 @@ const App = () => {
   };
 
   const handleDeviceFound = useCallback((device: ScanResult) => {
-    setDevices((prevDevices) => {
-      // Avoid duplicates
-      const exists = prevDevices.find((d) => d.id === device.id);
-      if (exists) {
-        return prevDevices;
-      }
-      return [...prevDevices, device];
+    console.log('[App] Device found:', {
+      id: device.id,
+      name: device.name,
+      rssi: device.rssi,
+      currentState: appState,
     });
-  }, []);
+    
+    // State: scanning-for-paired - auto-connect immediately when paired device found
+    if (appState === 'scanning-for-paired' && pairedDeviceId && device.id === pairedDeviceId) {
+      console.log('[App] Found paired device, auto-connecting immediately...');
+      stopScan();
+      handleConnect(device.id);
+      return;
+    }
+    
+    // State: scanning-no-paired - show all devices
+    if (appState === 'scanning-no-paired') {
+      setDevices((prevDevices) => {
+        // Avoid duplicates
+        const exists = prevDevices.find((d) => d.id === device.id);
+        if (exists) {
+          return prevDevices;
+        }
+        console.log('[App] Adding device to list:', device.name || device.id);
+        return [...prevDevices, device];
+      });
+    }
+  }, [appState, pairedDeviceId]);
 
   const startScan = async () => {
+    // Only scan if in scanning states
+    if (appState !== 'scanning-no-paired' && appState !== 'scanning-for-paired') {
+      return;
+    }
+
     const hasPermission = await requestPermissions();
     if (!hasPermission && Platform.OS === 'android') {
       return;
     }
 
-    setDevices([]);
-    setIsScanning(true);
-    setConnectionStatus('Scanning...');
+    // Clear devices list when starting scan (only for scanning-no-paired)
+    if (appState === 'scanning-no-paired') {
+      setDevices([]);
+    }
 
     try {
-      await scanForDevices(handleDeviceFound, 10000);
+      // Scan indefinitely - will stop when device is found and connected
+      await scanForDevices(handleDeviceFound);
     } catch (error: any) {
       console.error('Scan error:', error);
       Alert.alert('Scan Error', error.message || 'Failed to start scanning');
-      setIsScanning(false);
-      setConnectionStatus('Scan Failed');
     }
-
-    // Stop scanning after timeout
-    setTimeout(() => {
-      stopScan();
-      setIsScanning(false);
-      if (devices.length === 0) {
-        setConnectionStatus('No devices found');
-      } else {
-        setConnectionStatus('Scan complete');
-      }
-    }, 10000);
   };
 
   const handleConnect = async (deviceId: string, isRetry: boolean = false) => {
@@ -139,42 +171,28 @@ const App = () => {
     
     try {
       if (!isRetry) {
-        console.log('[App] Updating UI state: Connecting...');
-        setConnectionStatus('Connecting...');
         console.log('[App] Stopping scan...');
         stopScan();
-        setIsScanning(false);
-        console.log('[App] Scan stopped, UI updated');
       } else {
         console.log('[App] Retry attempt - clearing connection state first...');
-        setConnectionStatus('Clearing pairing...');
         await clearDeviceConnectionState(deviceId);
-        // Wait a bit longer for iOS to clear the pairing state
         await new Promise(resolve => setTimeout(resolve, 1000));
-        setConnectionStatus('Reconnecting...');
       }
 
       console.log('[App] Calling connectToDevice()...');
       const device = await connectToDevice(deviceId);
       console.log('[App] Device connected successfully');
-      console.log('[App] Connected device info:', {
-        id: device.id,
-        name: device.name,
-        rssi: device.rssi,
-      });
       
+      // Save pairedDeviceId and change state to connected
+      setPairedDeviceId(deviceId);
       setConnectedDevice(device);
-      setConnectionStatus('Connected');
-      console.log('[App] UI updated: device set, status=Connected');
+      setAppState('connected');
+      console.log('[App] State changed to: connected');
 
       // Monitor connection state
-      console.log('[App] Setting up connection monitoring...');
       monitorConnection(device, (connected) => {
-        console.log('[App] Connection state changed callback triggered');
-        console.log('[App] Connected:', connected);
-        setConnectionStatus(connected ? 'Connected' : 'Disconnected');
         if (!connected) {
-          console.log('[App] Device disconnected, clearing state');
+          console.log('[App] Device disconnected');
           setConnectedDevice(null);
           setNumberStream([]);
           // Clean up notification monitor
@@ -182,15 +200,15 @@ const App = () => {
             monitorCleanup();
             setMonitorCleanup(null);
           }
+          // Keep pairedDeviceId, change state to scanning-for-paired
+          setAppState('scanning-for-paired');
+          console.log('[App] State changed to: scanning-for-paired');
+          startScan();
         }
       });
-      console.log('[App] Connection monitoring set up');
 
-      // iOS will automatically show pairing dialog if needed
-      // Wait a bit for pairing to complete, then start monitoring notifications
-      console.log('[App] Waiting 2 seconds for pairing to complete, then starting notification monitoring...');
+      // Wait for pairing to complete, then start monitoring notifications
       setTimeout(() => {
-        console.log('[App] Timeout reached, starting notification monitoring');
         startMonitoringNotifications(device);
       }, 2000);
     } catch (error: any) {
@@ -248,14 +266,31 @@ const App = () => {
           'Please enter passkey 123456 when prompted to pair with the device.',
           [{ text: 'OK' }]
         );
+      } else if (errorMessage === 'Operation was cancelled') {
+        // Handle cancellation gracefully
+        console.log('[App] Operation was cancelled - handling gracefully');
+        setConnectedDevice(null);
+        // Return to scanning state based on whether we have pairedDeviceId
+        if (pairedDeviceId) {
+          setAppState('scanning-for-paired');
+          startScan();
+        } else {
+          setAppState('scanning-no-paired');
+          startScan();
+        }
+        return;
       } else {
         console.log('[App] Generic connection error');
         Alert.alert('Connection Error', errorMessage);
+        setConnectedDevice(null);
+        // Return to scanning state
+        if (pairedDeviceId) {
+          setAppState('scanning-for-paired');
+        } else {
+          setAppState('scanning-no-paired');
+        }
+        startScan();
       }
-      
-      setConnectionStatus('Connection Failed');
-      setConnectedDevice(null);
-      console.log('[App] UI updated: connection failed');
     }
   };
 
@@ -279,49 +314,40 @@ const App = () => {
         const updated = [value, ...prev];
         return updated.slice(0, 50);
       });
-      setConnectionStatus('Receiving data...');
+      console.log('[App] Receiving data...');
     });
     
     setMonitorCleanup(() => cleanup);
-    setConnectionStatus('Monitoring notifications...');
     console.log('[App] Notification monitoring started');
   };
 
   const handleDisconnect = async () => {
-    console.log('[App] handleDisconnect() called');
-    console.log('[App] Connected device:', connectedDevice ? {
-      id: connectedDevice.id,
-      name: connectedDevice.name,
-    } : 'null');
+    console.log('[App] handleDisconnect() called - manual disconnect');
     
     if (connectedDevice) {
       try {
-        console.log('[App] Calling disconnectFromDevice()...');
         await disconnectFromDevice(connectedDevice);
         console.log('[App] Device disconnected successfully');
         
-        console.log('[App] Clearing UI state');
+        // Clear pairedDeviceId and change state to scanning-no-paired
         setConnectedDevice(null);
         setNumberStream([]);
-        setConnectionStatus('Disconnected');
-        console.log('[App] UI updated: device cleared, status=Disconnected');
+        setPairedDeviceId(null);
+        setAppState('scanning-no-paired');
+        console.log('[App] State changed to: scanning-no-paired');
         
         // Clean up notification monitor
         if (monitorCleanup) {
           monitorCleanup();
           setMonitorCleanup(null);
         }
+        
+        // Start scanning for all devices
+        startScan();
       } catch (error: any) {
         console.error('[App] Disconnect error:', error);
-        console.error('[App] Disconnect error details:', JSON.stringify(error, null, 2));
-        if (error instanceof Error) {
-          console.error('[App] Error message:', error.message);
-          console.error('[App] Error stack:', error.stack);
-        }
         Alert.alert('Disconnect Error', error.message || 'Failed to disconnect');
       }
-    } else {
-      console.log('[App] No device connected, nothing to disconnect');
     }
   };
 
@@ -355,36 +381,16 @@ const App = () => {
         <Text style={styles.subtitle}>ESP32 Authorization Server</Text>
 
         <View style={styles.statusContainer}>
-          <Text style={styles.statusText}>Status: {connectionStatus}</Text>
+          <Text style={styles.statusText}>
+            Status: {
+              appState === 'scanning-no-paired' ? 'Scanning (no paired device)' :
+              appState === 'scanning-for-paired' ? 'Scanning for paired device' :
+              'Connected'
+            }
+          </Text>
         </View>
 
-        {!connectedDevice ? (
-          <>
-            <TouchableOpacity
-              style={[styles.button, isScanning && styles.buttonDisabled]}
-              onPress={startScan}
-              disabled={isScanning}
-            >
-              {isScanning ? (
-                <ActivityIndicator color="#fff" />
-              ) : (
-                <Text style={styles.buttonText}>Start Scan</Text>
-              )}
-            </TouchableOpacity>
-
-            {devices.length > 0 && (
-              <View style={styles.devicesContainer}>
-                <Text style={styles.sectionTitle}>Found Devices:</Text>
-                <FlatList
-                  data={devices}
-                  renderItem={renderDevice}
-                  keyExtractor={(item) => item.id}
-                  style={styles.devicesList}
-                />
-              </View>
-            )}
-          </>
-        ) : (
+        {appState === 'connected' && connectedDevice ? (
           <View style={styles.connectedContainer}>
             <View style={styles.deviceInfo}>
               <Text style={styles.connectedDeviceName}>
@@ -433,6 +439,48 @@ const App = () => {
               </Text>
             </View>
           </View>
+        ) : appState === 'scanning-for-paired' ? (
+          <>
+            <View style={styles.scanningIndicator}>
+              <ActivityIndicator color="#007AFF" size="small" />
+              <Text style={styles.scanningText}>Scanning for paired device...</Text>
+            </View>
+            <View style={styles.pairedDeviceInfo}>
+              <Text style={styles.pairedDeviceText}>
+                Looking for paired device. Tap below to clear and scan for all devices.
+              </Text>
+              <TouchableOpacity
+                style={[styles.button, styles.clearButton]}
+                onPress={() => {
+                  setPairedDeviceId(null);
+                  setDevices([]);
+                  setAppState('scanning-no-paired');
+                  console.log('[App] Cleared paired device ID, state: scanning-no-paired');
+                  startScan();
+                }}
+              >
+                <Text style={styles.buttonText}>Clear Paired Device</Text>
+              </TouchableOpacity>
+            </View>
+          </>
+        ) : (
+          <>
+            <View style={styles.scanningIndicator}>
+              <ActivityIndicator color="#007AFF" size="small" />
+              <Text style={styles.scanningText}>Scanning for devices...</Text>
+            </View>
+            {devices.length > 0 && (
+              <View style={styles.devicesContainer}>
+                <Text style={styles.sectionTitle}>Found Devices:</Text>
+                <FlatList
+                  data={devices}
+                  renderItem={renderDevice}
+                  keyExtractor={(item) => item.id}
+                  style={styles.devicesList}
+                />
+              </View>
+            )}
+          </>
         )}
       </View>
     </SafeAreaView>
@@ -480,13 +528,40 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginBottom: 16,
   },
-  buttonDisabled: {
-    backgroundColor: '#999',
-  },
   buttonText: {
     color: '#fff',
     fontSize: 16,
     fontWeight: '600',
+  },
+  scanningIndicator: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#fff',
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 20,
+  },
+  scanningText: {
+    marginLeft: 8,
+    fontSize: 14,
+    color: '#666',
+  },
+  pairedDeviceInfo: {
+    backgroundColor: '#E3F2FD',
+    padding: 16,
+    borderRadius: 8,
+    marginBottom: 20,
+    alignItems: 'center',
+  },
+  pairedDeviceText: {
+    fontSize: 14,
+    color: '#1976D2',
+    marginBottom: 12,
+    textAlign: 'center',
+  },
+  clearButton: {
+    backgroundColor: '#FF9800',
   },
   disconnectButton: {
     backgroundColor: '#FF3B30',

@@ -61,8 +61,7 @@ export interface ScanResult {
  * Scan for BLE devices matching the ESP32 server
  */
 export const scanForDevices = async (
-  onDeviceFound: (device: ScanResult) => void,
-  timeout: number = 10000
+  onDeviceFound: (device: ScanResult) => void
 ): Promise<void> => {
   const manager = getBleManager();
 
@@ -93,10 +92,7 @@ export const scanForDevices = async (
     }
   );
 
-  // Stop scanning after timeout
-  setTimeout(() => {
-    manager.stopDeviceScan();
-  }, timeout);
+  // Scanning continues indefinitely until stopScan() is called
 };
 
 /**
@@ -227,6 +223,14 @@ export const connectToDevice = async (deviceId: string, retryOnPairingMismatch: 
     console.log('[BleService] Connection process completed successfully');
     return device;
   } catch (error) {
+    const errorMessage = (error as any)?.message || '';
+    
+    // Handle "Operation was cancelled" gracefully - don't log as error
+    if (errorMessage === 'Operation was cancelled') {
+      console.log('[BleService] Operation was cancelled - handling gracefully');
+      throw error; // Re-throw but don't log as error
+    }
+    
     console.error('[BleService] Connection error:', error);
     console.error('[BleService] Connection error details:', JSON.stringify(error, null, 2));
     if (error instanceof Error) {
@@ -400,6 +404,12 @@ export const monitorCharacteristic = (
         CHARACTERISTIC_UUID,
         (error, characteristic) => {
           if (error) {
+            const errorMessage = error.message || '';
+            // Handle expected errors on disconnect gracefully
+            if (errorMessage.includes('disconnected') || errorMessage === 'Operation was cancelled') {
+              console.log('[BleService] Notification monitor stopped (device disconnected or cancelled)');
+              return;
+            }
             console.error('[BleService] Notification error:', error);
             console.error('[BleService] Notification error details:', JSON.stringify(error, null, 2));
             return;
