@@ -276,7 +276,7 @@
 					"-ObjC",
 					"-lc++",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = "com.lura-test.nathik";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.lura-test.lura";
 				PRODUCT_NAME = BLEScanner;
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
@@ -307,7 +307,7 @@
 					"-ObjC",
 					"-lc++",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = "com.lura-test.nathik";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.lura-test.lura";
 				PRODUCT_NAME = BLEScanner;
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SWIFT_VERSION = 5.0;
