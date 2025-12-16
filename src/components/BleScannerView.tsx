@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
   SafeAreaView,
   StatusBar,
@@ -8,10 +8,13 @@ import {
   TouchableOpacity,
   FlatList,
   ActivityIndicator,
+  TextInput,
+  Modal,
 } from 'react-native';
 import { Device } from 'react-native-ble-plx';
 import { ScanResult } from '../services/BleService';
 import { BleAppState } from '../state/BleStateMachine';
+import { useNgrokStore } from '../state/NgrokStore';
 
 interface BleScannerViewProps {
   appState: BleAppState;
@@ -216,6 +219,63 @@ const ScanningNoPairedView: React.FC<{
 };
 
 /**
+ * Ngrok URL Settings Component
+ */
+const NgrokUrlSettings: React.FC = () => {
+  const { ngrokUrl, setNgrokUrl } = useNgrokStore();
+  const [isEditing, setIsEditing] = useState(false);
+  const [editUrl, setEditUrl] = useState(ngrokUrl);
+
+  const handleSave = () => {
+    if (editUrl.trim()) {
+      setNgrokUrl(editUrl.trim());
+      setIsEditing(false);
+    }
+  };
+
+  const handleCancel = () => {
+    setEditUrl(ngrokUrl);
+    setIsEditing(false);
+  };
+
+  return (
+    <View style={styles.ngrokContainer}>
+      <Text style={styles.ngrokLabel}>Ngrok URL:</Text>
+      {isEditing ? (
+        <View style={styles.ngrokEditContainer}>
+          <TextInput
+            style={styles.ngrokInput}
+            value={editUrl}
+            onChangeText={setEditUrl}
+            placeholder="https://your-ngrok-url.ngrok-free.app"
+            autoCapitalize="none"
+            autoCorrect={false}
+            keyboardType="url"
+          />
+          <View style={styles.ngrokButtonRow}>
+            <TouchableOpacity style={[styles.ngrokButton, styles.saveButton]} onPress={handleSave}>
+              <Text style={styles.ngrokButtonText}>Save</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={[styles.ngrokButton, styles.cancelButton]} onPress={handleCancel}>
+              <Text style={styles.ngrokButtonText}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      ) : (
+        <View style={styles.ngrokDisplayContainer}>
+          <Text style={styles.ngrokUrlText} numberOfLines={1} ellipsizeMode="middle">
+            {ngrokUrl}
+          </Text>
+          <TouchableOpacity style={styles.editButton} onPress={() => setIsEditing(true)}>
+            <Text style={styles.editButtonText}>Edit</Text>
+          </TouchableOpacity>
+        </View>
+      )}
+    </View>
+  );
+};
+
+/**
  * Main BLE Scanner View Component
  * Routes to appropriate view component based on appState
  */
@@ -235,6 +295,8 @@ export const BleScannerView: React.FC<BleScannerViewProps> = ({
       <View style={styles.content}>
         <Text style={styles.title}>BLE Scanner</Text>
         <Text style={styles.subtitle}>ESP32 Authorization Server</Text>
+
+        <NgrokUrlSettings />
 
         <StatusBarComponent appState={appState} />
 
@@ -469,5 +531,74 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: '#1976D2',
     lineHeight: 18,
+  },
+  ngrokContainer: {
+    backgroundColor: '#fff',
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 20,
+  },
+  ngrokLabel: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#333',
+    marginBottom: 8,
+  },
+  ngrokDisplayContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  ngrokUrlText: {
+    flex: 1,
+    fontSize: 12,
+    color: '#666',
+    fontFamily: 'monospace',
+    marginRight: 8,
+  },
+  editButton: {
+    backgroundColor: '#007AFF',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 6,
+  },
+  editButtonText: {
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  ngrokEditContainer: {
+    marginTop: 8,
+  },
+  ngrokInput: {
+    borderWidth: 1,
+    borderColor: '#ddd',
+    borderRadius: 6,
+    padding: 10,
+    fontSize: 12,
+    fontFamily: 'monospace',
+    marginBottom: 8,
+    backgroundColor: '#f9f9f9',
+  },
+  ngrokButtonRow: {
+    flexDirection: 'row',
+  },
+  ngrokButton: {
+    flex: 1,
+    paddingVertical: 8,
+    borderRadius: 6,
+    alignItems: 'center',
+    marginHorizontal: 4,
+  },
+  saveButton: {
+    backgroundColor: '#34C759',
+  },
+  cancelButton: {
+    backgroundColor: '#999',
+  },
+  ngrokButtonText: {
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: '600',
   },
 });

@@ -1,8 +1,9 @@
 import React from 'react';
 import { useBleApp } from './src/hooks/useBleApp';
 import { BleScannerView } from './src/components/BleScannerView';
+import { NgrokStoreProvider } from './src/state/NgrokStore';
 
-const App = () => {
+const AppContent = () => {
   const {
     appState,
     devices,
@@ -25,6 +26,14 @@ const App = () => {
       onDisconnect={onDisconnect}
       onClearPairedDevice={onClearPairedDevice}
     />
+  );
+};
+
+const App = () => {
+  return (
+    <NgrokStoreProvider>
+      <AppContent />
+    </NgrokStoreProvider>
   );
 };
 

@@ -25,6 +25,7 @@ import {
   addNumberToStream,
   clearDeviceList,
 } from '../state/BleStateMachine';
+import { useNgrokStore } from '../state/NgrokStore';
 
 /**
  * Main business logic hook for BLE app
@@ -36,6 +37,8 @@ export const useBleApp = () => {
   const connectionMonitorCleanupRef = useRef<(() => void) | null>(null);
   const isConnectingRef = useRef(false);
   const handleConnectRef = useRef<((deviceId: string, isRetry?: boolean) => Promise<void>) | null>(null);
+  const { ngrokUrl } = useNgrokStore();
+  const lastPacketSentTimeRef = useRef<number>(0);
 
   /**
    * Request Bluetooth permissions (Android only)
@@ -66,22 +69,72 @@ export const useBleApp = () => {
   }, []);
 
   /**
+   * Forward number to ngrok endpoint
+   */
+  const forwardNumberToNgrok = useCallback(
+    async (number: string) => {
+      const currentTime = Date.now();
+      const timeSinceLastPacket = currentTime - lastPacketSentTimeRef.current;
+
+      // Throttle: only send if > 1 second since last packet
+      if (timeSinceLastPacket > 1000 && ngrokUrl) {
+        try {
+          const num = Number(number);
+          if (isNaN(num)) {
+            console.warn('[NGROK] Invalid number received:', number);
+            return;
+          }
+
+          console.log(`📤 [NGROK] Sending number to ${ngrokUrl}: ${num} (${timeSinceLastPacket}ms since last packet)`);
+
+          const response = await fetch(`${ngrokUrl}/number`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ number: num }),
+          });
+
+          if (response.ok) {
+            const result = await response.json();
+            lastPacketSentTimeRef.current = currentTime;
+            console.log('🟢 [NGROK] Number sent successfully:', result);
+          } else {
+            console.error('🔴 [NGROK] Failed to send number:', response.status, response.statusText);
+          }
+        } catch (error) {
+          console.error('🔴 [NGROK] Error sending number to ngrok:', error);
+        }
+      } else {
+        console.log(`⏭️ [NGROK] Skipping send - only ${timeSinceLastPacket}ms since last packet (need > 1000ms)`);
+      }
+    },
+    [ngrokUrl]
+  );
+
+  /**
    * Start monitoring notifications from device
    */
-  const startMonitoringNotifications = useCallback((device: Device) => {
-    // Clear existing stream
-    setContext((prev) => ({ ...prev, numberStream: [] }));
+  const startMonitoringNotifications = useCallback(
+    (device: Device) => {
+      // Clear existing stream
+      setContext((prev) => ({ ...prev, numberStream: [] }));
+      lastPacketSentTimeRef.current = 0;
 
-    // Clean up any existing monitor
-    if (monitorCleanupRef.current) {
-      monitorCleanupRef.current();
-    }
+      // Clean up any existing monitor
+      if (monitorCleanupRef.current) {
+        monitorCleanupRef.current();
+      }
 
-    // Start monitoring notifications
-    monitorCleanupRef.current = monitorCharacteristic(device, (value: string) => {
-      setContext((prev) => addNumberToStream(prev, value));
-    });
-  }, []);
+      // Start monitoring notifications
+      monitorCleanupRef.current = monitorCharacteristic(device, (value: string) => {
+        setContext((prev) => addNumberToStream(prev, value));
+        // Forward to ngrok endpoint
+        forwardNumberToNgrok(value);
+      });
+    },
+    [forwardNumberToNgrok]
+  );
 
   /**
    * Handle connection to device
@@ -189,7 +242,7 @@ export const useBleApp = () => {
         }));
       }
     },
-    [startMonitoringNotifications]
+    [startMonitoringNotifications, forwardNumberToNgrok]
   );
 
   // Update ref when handleConnect changes
