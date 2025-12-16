@@ -9,6 +9,7 @@ import {
   disconnectFromDevice,
   monitorConnection,
   monitorCharacteristic,
+  readCharacteristic,
   isPairingMismatchError,
   clearDeviceConnectionState,
   ScanResult,
@@ -175,10 +176,34 @@ export const useBleApp = () => {
           }
         });
 
-        // Wait for pairing to complete, then start monitoring notifications
-        setTimeout(() => {
-          startMonitoringNotifications(device);
-        }, 2000);
+        // Event-based: Try to start monitoring notifications immediately
+        // If pairing isn't complete, retry until it succeeds
+        const tryStartMonitoring = async (retryCount = 0) => {
+          try {
+            // Try to read characteristic to verify pairing is complete
+            // If this succeeds, we can safely start monitoring
+            await readCharacteristic(device);
+            // Pairing complete - start monitoring
+            startMonitoringNotifications(device);
+          } catch (error: any) {
+            const errorMessage = error.message || '';
+            if ((errorMessage.includes('authentication') || 
+                 errorMessage.includes('authorization') ||
+                 errorMessage.includes('not authorized')) && 
+                retryCount < 10) {
+              // Pairing not complete yet - retry after delay
+              setTimeout(() => {
+                tryStartMonitoring(retryCount + 1);
+              }, 500);
+            } else {
+              // Other error or max retries reached - start monitoring anyway
+              // Monitoring might still work even if read failed
+              startMonitoringNotifications(device);
+            }
+          }
+        };
+        
+        tryStartMonitoring();
 
         isConnectingRef.current = false;
       } catch (error: any) {
